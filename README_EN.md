@@ -5,6 +5,8 @@
 
 A tool for easily creating expression difference images for PNGTubers.
 
+📝 [Usage Guide (Japanese, note.com)](https://note.com/rotejin/n/n106abaaa3957)
+
 [日本語](README.md)
 
 ---

@@ -5,6 +5,8 @@
 
 PNGTuber用の表情差分画像を簡単に作成するツールです。
 
+📝 [使い方の解説記事（note）](https://note.com/rotejin/n/n106abaaa3957)
+
 [English](README_EN.md)
 
 ---
