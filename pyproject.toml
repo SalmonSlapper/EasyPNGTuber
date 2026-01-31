@@ -1,0 +1,15 @@
+[project]
+name = "easy-pngtuber"
+version = "1.0.0"
+description = "AI生成画像の位置合わせと差分抽出ツール集"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.4.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+]
+
+[tool.uv]
+package = false
