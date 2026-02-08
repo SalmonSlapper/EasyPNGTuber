@@ -107,7 +107,8 @@ class Aligner:
                 return self._error_result("特徴点が不足")
             
             # マッチング（KNN + 比率テスト）
-            matcher = cv2.BFMatcher(cv2.NORM_L2)
+            # AKAZE(MLDB)はバイナリ記述子のためHamming距離を使用
+            matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
             matches = matcher.knnMatch(des1, des2, k=2)
             
             # 良いマッチを選択（Lowe's ratio test）
@@ -313,3 +314,29 @@ class Aligner:
             )
         
         return result
+
+    def apply_transform_with_mask(
+        self,
+        image: np.ndarray,
+        matrix: np.ndarray,
+        output_size: Optional[Tuple[int, int]] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """変換結果と有効領域マスクを返す
+
+        有効領域マスクは、変換後に「元画像由来の画素が存在する領域」を255で表す。
+        """
+        if output_size is None:
+            output_size = (image.shape[1], image.shape[0])
+
+        transformed = self.apply_transform(image, matrix, output_size)
+
+        source_h, source_w = image.shape[:2]
+        source_valid = np.full((source_h, source_w), 255, dtype=np.uint8)
+        valid_mask = cv2.warpAffine(
+            source_valid, matrix, output_size,
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+
+        return transformed, valid_mask

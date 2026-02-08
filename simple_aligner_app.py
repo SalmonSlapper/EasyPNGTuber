@@ -11,13 +11,20 @@ from typing import Optional, List
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QMessageBox, QListWidget,
-    QListWidgetItem, QGroupBox, QSplitter, QScrollArea, QProgressDialog
+    QListWidgetItem, QGroupBox, QSplitter, QScrollArea, QProgressDialog,
+    QCheckBox, QSpinBox, QDoubleSpinBox
 )
-from PySide6.QtCore import Qt, Signal, QPoint, QMimeData
+from PySide6.QtCore import Qt, Signal, QPoint, QMimeData, QSettings
 from PySide6.QtGui import QPixmap, QMouseEvent, QDragEnterEvent, QDropEvent
 
 from aligner import Aligner, AlignConfig
-from cv2_utils import load_image, save_image, convert_to_qimage
+from cv2_utils import (
+    load_image,
+    save_image,
+    convert_to_qimage,
+    compute_common_valid_rect,
+    crop_image
+)
 
 
 class ImageItem:
@@ -27,8 +34,13 @@ class ImageItem:
         self.name = Path(path).name
         self.image: Optional[np.ndarray] = None
         self.aligned_image: Optional[np.ndarray] = None
+        self.aligned_valid_mask: Optional[np.ndarray] = None  # 255=有効領域
         self.alignment_success: bool = False
         self.alignment_score: float = 0.0
+        self.alignment_method: str = ""
+        self.alignment_inliers: int = 0
+        self.alignment_total_matches: int = 0
+        self.alignment_error: str = ""
 
 
 class SimplePreviewWidget(QWidget):
@@ -93,7 +105,7 @@ class SimplePreviewWidget(QWidget):
 
         scale_w = (viewport.width() - 20) / img_w
         scale_h = (viewport.height() - 20) / img_h
-        self.scale = min(scale_w, scale_h, 1.0)
+        self.scale = max(0.01, min(scale_w, scale_h, 1.0))
         self._update_display()
 
     def _update_display(self):
@@ -229,7 +241,16 @@ class SimpleAlignerWindow(QMainWindow):
         # アライナー
         self.aligner = Aligner(AlignConfig())
 
+        # 設定保存
+        self.settings = QSettings("EasyPNGTuber", "SimpleAligner")
+        self._last_base_dir = ""
+        self._last_add_dir = ""
+        self._last_save_dir = ""
+
         self._setup_ui()
+        self._load_settings()
+        self._update_trim_info_label()
+        self._update_status_summary()
 
     def _setup_ui(self):
         central = QWidget()
@@ -238,6 +259,7 @@ class SimpleAlignerWindow(QMainWindow):
         layout = QHBoxLayout(central)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter = splitter
 
         # === 左パネル（画像リスト）===
         left_panel = QWidget()
@@ -318,10 +340,47 @@ class SimpleAlignerWindow(QMainWindow):
         self.btn_align_all.clicked.connect(self._align_all)
         align_layout.addWidget(self.btn_align_all)
 
+        retry_threshold_layout = QHBoxLayout()
+        retry_threshold_layout.addWidget(QLabel("再試行しきい値:"))
+        self.spin_retry_threshold = QDoubleSpinBox()
+        self.spin_retry_threshold.setRange(0.0, 1.0)
+        self.spin_retry_threshold.setSingleStep(0.05)
+        self.spin_retry_threshold.setDecimals(2)
+        self.spin_retry_threshold.setValue(max(0.6, self.aligner.config.success_score_threshold))
+        self.spin_retry_threshold.valueChanged.connect(self._on_retry_threshold_changed)
+        retry_threshold_layout.addWidget(self.spin_retry_threshold)
+        align_layout.addLayout(retry_threshold_layout)
+
+        self.btn_align_low_score = QPushButton("低スコアのみ再試行")
+        self.btn_align_low_score.clicked.connect(self._align_low_score_only)
+        align_layout.addWidget(self.btn_align_low_score)
+
+        self.btn_next_issue = QPushButton("次の要調整画像へ")
+        self.btn_next_issue.clicked.connect(self._jump_to_next_issue)
+        align_layout.addWidget(self.btn_next_issue)
+
+        self.btn_set_center_roi = QPushButton("中央ROIを自動設定")
+        self.btn_set_center_roi.clicked.connect(self._set_center_roi)
+        align_layout.addWidget(self.btn_set_center_roi)
+
         self.lbl_align_status = QLabel("")
+        self.lbl_align_status.setWordWrap(True)
         align_layout.addWidget(self.lbl_align_status)
 
         right_layout.addWidget(align_group)
+
+        # ステータス
+        status_group = QGroupBox("ステータス")
+        status_layout = QVBoxLayout(status_group)
+        self.lbl_status_summary = QLabel("未実行")
+        self.lbl_status_summary.setStyleSheet("color: #888;")
+        self.lbl_status_summary.setWordWrap(True)
+        status_layout.addWidget(self.lbl_status_summary)
+        self.lbl_status_detail = QLabel("詳細: 画像を選択してください")
+        self.lbl_status_detail.setStyleSheet("color: #888;")
+        self.lbl_status_detail.setWordWrap(True)
+        status_layout.addWidget(self.lbl_status_detail)
+        right_layout.addWidget(status_group)
 
         # 表示
         view_group = QGroupBox("表示")
@@ -352,6 +411,26 @@ class SimpleAlignerWindow(QMainWindow):
         # 保存
         save_group = QGroupBox("保存")
         save_layout = QVBoxLayout(save_group)
+
+        self.check_auto_trim = QCheckBox("位置合わせ余白を自動トリミング")
+        self.check_auto_trim.setChecked(True)
+        self.check_auto_trim.toggled.connect(self._update_trim_info_label)
+        save_layout.addWidget(self.check_auto_trim)
+
+        trim_margin_layout = QHBoxLayout()
+        trim_margin_layout.addWidget(QLabel("マージン:"))
+        self.spin_trim_margin = QSpinBox()
+        self.spin_trim_margin.setRange(0, 100)
+        self.spin_trim_margin.setValue(0)
+        self.spin_trim_margin.setSuffix("px")
+        self.spin_trim_margin.valueChanged.connect(self._update_trim_info_label)
+        trim_margin_layout.addWidget(self.spin_trim_margin)
+        trim_margin_layout.addStretch()
+        save_layout.addLayout(trim_margin_layout)
+
+        self.lbl_trim_info = QLabel("トリミング範囲: 未計算")
+        self.lbl_trim_info.setStyleSheet("color: #888;")
+        save_layout.addWidget(self.lbl_trim_info)
 
         self.btn_save_current = QPushButton("選択画像を保存...")
         self.btn_save_current.clicked.connect(self._save_current)
@@ -392,6 +471,7 @@ class SimpleAlignerWindow(QMainWindow):
             self.base_image = load_image(first_path)
             if self.base_image is not None:
                 self.base_path = first_path
+                self._last_base_dir = str(Path(first_path).parent)
                 self.lbl_base.setText(Path(first_path).name)
                 self.lbl_base.setStyleSheet("color: #4ade80;")
                 self.preview.set_base_image(self.base_image)
@@ -404,39 +484,57 @@ class SimpleAlignerWindow(QMainWindow):
             item.image = load_image(path)
             if item.image is not None:
                 self.images.append(item)
-                list_item = QListWidgetItem(item.name)
+                list_item = QListWidgetItem(self._format_list_item_text(item))
                 self.image_list.addItem(list_item)
 
+        if paths:
+            self._last_add_dir = str(Path(paths[0]).parent)
+
+        self._update_trim_info_label()
+        self._update_status_summary()
+
     def _load_base_image(self):
+        start_dir = self._last_base_dir or self._last_add_dir or ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "ベース画像を選択", "", "Images (*.png *.jpg *.jpeg *.bmp)"
+            self, "ベース画像を選択", start_dir, "Images (*.png *.jpg *.jpeg *.bmp)"
         )
         if path:
             self.base_image = load_image(path)
             if self.base_image is not None:
                 self.base_path = path
+                self._last_base_dir = str(Path(path).parent)
                 self.lbl_base.setText(Path(path).name)
                 self.lbl_base.setStyleSheet("color: #4ade80;")
                 self.preview.set_base_image(self.base_image)
                 self.preview.fit_to_window()
+                self._update_trim_info_label()
+                self._update_status_summary()
 
     def _add_images(self):
+        start_dir = self._last_add_dir or self._last_base_dir or ""
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "差分画像を追加", "", "Images (*.png *.jpg *.jpeg *.bmp)"
+            self, "差分画像を追加", start_dir, "Images (*.png *.jpg *.jpeg *.bmp)"
         )
         for path in paths:
             item = ImageItem(path)
             item.image = load_image(path)
             if item.image is not None:
                 self.images.append(item)
-                list_item = QListWidgetItem(item.name)
+                list_item = QListWidgetItem(self._format_list_item_text(item))
                 self.image_list.addItem(list_item)
+        if paths:
+            self._last_add_dir = str(Path(paths[0]).parent)
+        self._update_trim_info_label()
+        self._update_status_summary()
 
     def _clear_images(self):
         self.images.clear()
         self.image_list.clear()
         self.current_index = -1
         self.preview.set_overlay_image(None)
+        self.lbl_align_status.setText("")
+        self._update_trim_info_label()
+        self._update_status_summary()
 
     def _on_image_selected(self, index: int):
         self.current_index = index
@@ -447,6 +545,87 @@ class SimpleAlignerWindow(QMainWindow):
                 self.preview.set_overlay_image(item.aligned_image)
             else:
                 self.preview.set_overlay_image(item.image)
+            self._update_current_detail(item)
+        else:
+            self.lbl_status_detail.setText("詳細: 画像を選択してください")
+            self.lbl_status_detail.setStyleSheet("color: #888;")
+
+    def _format_list_item_text(self, item: ImageItem) -> str:
+        """画像リスト表示テキストを生成"""
+        if item.aligned_image is None:
+            return f"○ {item.name}"
+        status = "✓" if item.alignment_success else "⚠"
+        method = item.alignment_method if item.alignment_method else "-"
+        return f"{status} [{item.alignment_score:.2f}/{method}] {item.name}"
+
+    def _update_list_item(self, index: int):
+        """指定行の表示を更新"""
+        if not (0 <= index < len(self.images)):
+            return
+        list_item = self.image_list.item(index)
+        if list_item is None:
+            return
+        list_item.setText(self._format_list_item_text(self.images[index]))
+
+    def _update_current_detail(self, item: ImageItem):
+        """選択中画像の詳細を更新"""
+        if item.aligned_image is None:
+            self.lbl_status_detail.setText("詳細: 未実行")
+            self.lbl_status_detail.setStyleSheet("color: #888;")
+            return
+
+        method = item.alignment_method or "-"
+        match_info = f"{item.alignment_inliers}/{item.alignment_total_matches}" if item.alignment_total_matches > 0 else "-"
+        threshold = self.spin_retry_threshold.value() if hasattr(self, "spin_retry_threshold") else 0.6
+        if item.alignment_success and item.alignment_score >= threshold:
+            color = "#4ade80"
+            head = "成功"
+        elif item.alignment_success:
+            color = "#fbbf24"
+            head = "低スコア（再調整推奨）"
+        else:
+            color = "#f87171"
+            head = "要調整"
+
+        detail = f"詳細: {head} / score={item.alignment_score:.2f} / {method} / inlier={match_info}"
+        if item.alignment_error:
+            detail += f"\n理由: {item.alignment_error}"
+        self.lbl_status_detail.setText(detail)
+        self.lbl_status_detail.setStyleSheet(f"color: {color};")
+
+    def _update_status_summary(self):
+        """全体ステータス表示を更新"""
+        total = len(self.images)
+        if total == 0:
+            self.lbl_status_summary.setText("未実行（差分画像を追加してください）")
+            self.lbl_status_summary.setStyleSheet("color: #888;")
+            return
+
+        aligned_items = [item for item in self.images if item.aligned_image is not None]
+        if not aligned_items:
+            self.lbl_status_summary.setText(f"未実行: 0/{total}")
+            self.lbl_status_summary.setStyleSheet("color: #fbbf24;")
+            return
+
+        success_count = sum(1 for item in aligned_items if item.alignment_success)
+        retry_threshold = self.spin_retry_threshold.value() if hasattr(self, "spin_retry_threshold") else 0.6
+        low_score_count = sum(1 for item in aligned_items if item.alignment_score < retry_threshold)
+        avg_score = sum(item.alignment_score for item in aligned_items) / len(aligned_items)
+
+        color = "#4ade80" if success_count == len(aligned_items) else "#fbbf24"
+        if success_count == 0:
+            color = "#f87171"
+
+        self.lbl_status_summary.setText(
+            f"実行済み: {len(aligned_items)}/{total} / 成功: {success_count} / 要調整: {low_score_count}\n"
+            f"平均スコア: {avg_score:.2f}（再試行しきい値 {retry_threshold:.2f}）"
+        )
+        self.lbl_status_summary.setStyleSheet(f"color: {color};")
+
+    def _on_retry_threshold_changed(self, value: float):
+        self._update_status_summary()
+        if 0 <= self.current_index < len(self.images):
+            self._update_current_detail(self.images[self.current_index])
 
     def _start_roi_select(self):
         if self.base_image is None:
@@ -485,6 +664,100 @@ class SimpleAlignerWindow(QMainWindow):
         self.lbl_roi.setStyleSheet("color: #888;")
         self.btn_roi_clear.setEnabled(False)
 
+    def _set_center_roi(self):
+        """顔領域を想定した中央ROIを自動設定"""
+        if self.base_image is None:
+            QMessageBox.warning(self, "警告", "先にベース画像を選択してください")
+            return
+
+        img_h, img_w = self.base_image.shape[:2]
+        roi_w = max(50, int(img_w * 0.7))
+        roi_h = max(50, int(img_h * 0.7))
+        x = max(0, (img_w - roi_w) // 2)
+        y = max(0, (img_h - roi_h) // 2)
+        self.roi = (x, y, roi_w, roi_h)
+        self.preview.set_roi(x, y, roi_w, roi_h)
+        self.lbl_roi.setText(f"({x}, {y}) - {roi_w}x{roi_h} [中央自動]")
+        self.lbl_roi.setStyleSheet("color: #00a2e8;")
+        self.btn_roi_clear.setEnabled(True)
+        self.statusBar().showMessage("中央ROIを設定しました。再試行してください。")
+
+    def _collect_issue_indices(self, threshold: Optional[float] = None) -> List[int]:
+        """再調整が必要な画像インデックスを収集"""
+        if threshold is None:
+            threshold = self.spin_retry_threshold.value()
+
+        issue_indices: List[int] = []
+        for i, item in enumerate(self.images):
+            if item.aligned_image is None:
+                issue_indices.append(i)
+                continue
+            if not item.alignment_success or item.alignment_score < threshold:
+                issue_indices.append(i)
+        return issue_indices
+
+    def _jump_to_next_issue(self):
+        """次の要調整画像へジャンプ"""
+        if not self.images:
+            QMessageBox.information(self, "情報", "差分画像がありません")
+            return
+
+        issue_indices = self._collect_issue_indices()
+        if not issue_indices:
+            QMessageBox.information(self, "情報", "要調整画像はありません")
+            return
+
+        start = self.current_index + 1 if self.current_index >= 0 else 0
+        ordered = issue_indices + issue_indices
+        target = None
+        for idx in ordered:
+            if idx >= start:
+                target = idx
+                break
+        if target is None:
+            target = issue_indices[0]
+
+        self.image_list.setCurrentRow(target)
+        self.statusBar().showMessage(f"要調整画像へ移動: {self.images[target].name}")
+
+    def _align_low_score_only(self):
+        """低スコア・失敗画像のみ再試行"""
+        if self.base_image is None:
+            QMessageBox.warning(self, "警告", "ベース画像を選択してください")
+            return
+
+        issue_indices = self._collect_issue_indices(self.spin_retry_threshold.value())
+        if not issue_indices:
+            QMessageBox.information(self, "情報", "再試行が必要な画像はありません")
+            return
+
+        progress = QProgressDialog("再試行中...", "キャンセル", 0, len(issue_indices), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+
+        success_count = 0
+        for pos, idx in enumerate(issue_indices):
+            if progress.wasCanceled():
+                break
+            progress.setValue(pos)
+            item = self.images[idx]
+            progress.setLabelText(f"再試行: {item.name}")
+            success = self._align_image(item)
+            self._update_list_item(idx)
+            if success:
+                success_count += 1
+
+        progress.setValue(len(issue_indices))
+        self._update_trim_info_label()
+        self._update_status_summary()
+        if 0 <= self.current_index < len(self.images):
+            self._update_current_detail(self.images[self.current_index])
+
+        QMessageBox.information(
+            self, "完了",
+            f"低スコア再試行完了\n成功: {success_count}/{len(issue_indices)}\n"
+            f"しきい値: {self.spin_retry_threshold.value():.2f}"
+        )
+
     def _zoom_in(self):
         self.preview.scale = min(5.0, self.preview.scale * 1.25)
         self._update_zoom_label()
@@ -501,6 +774,54 @@ class SimpleAlignerWindow(QMainWindow):
 
     def _update_zoom_label(self):
         self.lbl_zoom.setText(f"{int(self.preview.scale * 100)}%")
+
+    def _get_trim_rect(self, target_items: List[ImageItem]) -> Optional[tuple]:
+        """指定画像群に対する共通トリミング矩形を計算"""
+        if not self.check_auto_trim.isChecked() or self.base_image is None:
+            return None
+
+        base_h, base_w = self.base_image.shape[:2]
+        valid_masks = [np.full((base_h, base_w), 255, dtype=np.uint8)]
+
+        for item in target_items:
+            if item.aligned_image is None:
+                continue
+            if item.aligned_image.shape[:2] != (base_h, base_w):
+                continue
+            if item.aligned_valid_mask is not None:
+                valid_masks.append(item.aligned_valid_mask)
+            else:
+                valid_masks.append(np.full((base_h, base_w), 255, dtype=np.uint8))
+
+        return compute_common_valid_rect(valid_masks, margin=self.spin_trim_margin.value())
+
+    def _update_trim_info_label(self):
+        """トリミング設定ラベルを更新"""
+        if not hasattr(self, "lbl_trim_info"):
+            return
+
+        if not self.check_auto_trim.isChecked():
+            self.lbl_trim_info.setText("トリミング範囲: OFF")
+            self.lbl_trim_info.setStyleSheet("color: #888;")
+            return
+
+        aligned_items = [item for item in self.images if item.aligned_image is not None]
+        rect = self._get_trim_rect(aligned_items)
+        if rect is None:
+            self.lbl_trim_info.setText("トリミング範囲: 計算不可")
+            self.lbl_trim_info.setStyleSheet("color: #fbbf24;")
+            return
+
+        if self.base_image is not None:
+            base_h, base_w = self.base_image.shape[:2]
+            if rect == (0, 0, base_w, base_h):
+                self.lbl_trim_info.setText("トリミング範囲: 全体（余白なし）")
+                self.lbl_trim_info.setStyleSheet("color: #4ade80;")
+                return
+
+        x, y, w, h = rect
+        self.lbl_trim_info.setText(f"トリミング範囲: x={x}, y={y}, w={w}, h={h}")
+        self.lbl_trim_info.setStyleSheet("color: #60a5fa;")
 
     def _create_roi_mask(self) -> Optional[np.ndarray]:
         if self.roi is None or self.base_image is None:
@@ -519,16 +840,25 @@ class SimpleAlignerWindow(QMainWindow):
         mask = self._create_roi_mask()
         result = self.aligner.align(self.base_image, item.image, base_mask=mask)
 
-        item.alignment_success = result['success']
+        item.alignment_success = bool(result['success'])
         item.alignment_score = result['score']
+        item.alignment_method = result.get('method', '')
+        item.alignment_inliers = int(result.get('inliers', 0))
+        item.alignment_total_matches = int(result.get('total_matches', 0))
+        item.alignment_error = result.get('error_message', '')
 
         if result['matrix'] is not None:
             h, w = self.base_image.shape[:2]
-            item.aligned_image = self.aligner.apply_transform(item.image, result['matrix'], (w, h))
-            return True
+            aligned, valid_mask = self.aligner.apply_transform_with_mask(
+                item.image, result['matrix'], (w, h)
+            )
+            item.aligned_image = aligned
+            item.aligned_valid_mask = valid_mask
         else:
             item.aligned_image = item.image.copy()
-            return False
+            item.aligned_valid_mask = np.full(item.image.shape[:2], 255, dtype=np.uint8)
+
+        return item.alignment_success
 
     def _align_current(self):
         if self.base_image is None:
@@ -543,19 +873,30 @@ class SimpleAlignerWindow(QMainWindow):
         success = self._align_image(item)
 
         # リスト更新
-        list_item = self.image_list.item(self.current_index)
-        status = "✓" if success else "⚠"
-        list_item.setText(f"{status} {item.name}")
+        self._update_list_item(self.current_index)
 
         # プレビュー更新
         self.preview.set_overlay_image(item.aligned_image)
 
+        method = item.alignment_method or "-"
         self.lbl_align_status.setText(
-            f"{'成功' if success else '失敗'} (スコア: {item.alignment_score:.2f})"
+            f"{'成功' if success else '要調整'} (score={item.alignment_score:.2f}, method={method})"
         )
-        self.lbl_align_status.setStyleSheet(
-            "color: #4ade80;" if success else "color: #f87171;"
-        )
+        if success:
+            self.lbl_align_status.setStyleSheet("color: #4ade80;")
+        elif item.alignment_score >= self.spin_retry_threshold.value():
+            self.lbl_align_status.setStyleSheet("color: #fbbf24;")
+        else:
+            self.lbl_align_status.setStyleSheet("color: #f87171;")
+
+        if not success:
+            self.statusBar().showMessage("要調整: ROIを顔中心に絞って再試行、または「低スコアのみ再試行」を実行してください")
+        else:
+            self.statusBar().showMessage("位置合わせ成功")
+
+        self._update_current_detail(item)
+        self._update_trim_info_label()
+        self._update_status_summary()
 
     def _align_all(self):
         if self.base_image is None:
@@ -582,9 +923,7 @@ class SimpleAlignerWindow(QMainWindow):
                 success_count += 1
 
             # リスト更新
-            list_item = self.image_list.item(i)
-            status = "✓" if success else "⚠"
-            list_item.setText(f"{status} {item.name}")
+            self._update_list_item(i)
 
         progress.setValue(len(self.images))
 
@@ -597,6 +936,13 @@ class SimpleAlignerWindow(QMainWindow):
             self, "完了",
             f"一括位置合わせ完了\n{success_count}/{len(self.images)}件成功"
         )
+        self.statusBar().showMessage(
+            f"一括位置合わせ完了: 成功 {success_count}/{len(self.images)} / しきい値 {self.spin_retry_threshold.value():.2f}"
+        )
+        if 0 <= self.current_index < len(self.images):
+            self._update_current_detail(self.images[self.current_index])
+        self._update_trim_info_label()
+        self._update_status_summary()
 
     def _save_current(self):
         if self.current_index < 0 or self.current_index >= len(self.images):
@@ -612,12 +958,33 @@ class SimpleAlignerWindow(QMainWindow):
         base_name = Path(self.base_path).stem if self.base_path else "output"
         num = self.current_index + 1
         default_name = f"{base_name}_{num:02d}.png"
+        default_path = str(Path(self._last_save_dir) / default_name) if self._last_save_dir else default_name
         path, _ = QFileDialog.getSaveFileName(
-            self, "保存先を選択", default_name, "PNG (*.png)"
+            self, "保存先を選択", default_path, "PNG (*.png)"
         )
         if path:
-            save_image(path, item.aligned_image)
-            QMessageBox.information(self, "完了", f"保存しました:\n{path}")
+            try:
+                trim_rect = self._get_trim_rect([item])
+                if self.check_auto_trim.isChecked() and trim_rect is None:
+                    QMessageBox.warning(self, "警告", "トリミング範囲を計算できませんでした。")
+                    return
+
+                if trim_rect is not None and self.base_image is not None:
+                    base_h, base_w = self.base_image.shape[:2]
+                    if item.aligned_image.shape[:2] != (base_h, base_w):
+                        QMessageBox.warning(self, "警告", "この画像はベースサイズと異なるためトリミングできません。")
+                        return
+                    output = crop_image(item.aligned_image, trim_rect)
+                else:
+                    output = item.aligned_image
+
+                ok = save_image(path, output)
+                if not ok:
+                    raise RuntimeError("save_image returned False")
+                self._last_save_dir = str(Path(path).parent)
+                QMessageBox.information(self, "完了", f"保存しました:\n{path}")
+            except Exception as e:
+                QMessageBox.warning(self, "エラー", f"保存に失敗しました:\n{e}")
 
     def _save_all(self):
         if self.base_image is None:
@@ -630,9 +997,12 @@ class SimpleAlignerWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "位置合わせ済みの画像がありません")
             return
 
-        output_dir = QFileDialog.getExistingDirectory(self, "保存先フォルダを選択")
+        output_dir = QFileDialog.getExistingDirectory(
+            self, "保存先フォルダを選択", self._last_save_dir or self._last_base_dir or ""
+        )
         if not output_dir:
             return
+        self._last_save_dir = output_dir
 
         output_path = Path(output_dir)
         saved = 0
@@ -640,9 +1010,20 @@ class SimpleAlignerWindow(QMainWindow):
         # ベース画像名_連番形式
         base_name = Path(self.base_path).stem if self.base_path else "output"
 
+        trim_rect = self._get_trim_rect([item for item in self.images if item.aligned_image is not None])
+        if self.check_auto_trim.isChecked() and trim_rect is None:
+            QMessageBox.warning(self, "警告", "トリミング範囲を計算できませんでした。")
+            return
+
+        base_h, base_w = self.base_image.shape[:2]
+        trim_skipped = []
+
         # ベース画像を00として保存
         base_filename = f"{base_name}_00.png"
-        save_image(str(output_path / base_filename), self.base_image)
+        base_output = crop_image(self.base_image, trim_rect) if trim_rect is not None else self.base_image
+        if not save_image(str(output_path / base_filename), base_output):
+            QMessageBox.warning(self, "エラー", f"{base_filename} の保存に失敗しました")
+            return
         saved += 1
 
         # 差分画像を01, 02, 03...として保存
@@ -651,15 +1032,72 @@ class SimpleAlignerWindow(QMainWindow):
                 num = i + 1
                 filename = f"{base_name}_{num:02d}.png"
                 save_path = output_path / filename
-                save_image(str(save_path), item.aligned_image)
+                output = item.aligned_image
+                if trim_rect is not None:
+                    if item.aligned_image.shape[:2] == (base_h, base_w):
+                        output = crop_image(item.aligned_image, trim_rect)
+                    else:
+                        trim_skipped.append(filename)
+                if not save_image(str(save_path), output):
+                    QMessageBox.warning(self, "エラー", f"{filename} の保存に失敗しました")
+                    return
                 saved += 1
+
+        trim_note = ""
+        if trim_rect is not None:
+            x, y, w, h = trim_rect
+            trim_note = f"\n・トリミング: x={x}, y={y}, w={w}, h={h}"
+            if trim_skipped:
+                trim_note += f"\n・トリミング未適用: {', '.join(trim_skipped)}"
 
         QMessageBox.information(
             self, "完了",
             f"{saved}件の画像を保存しました:\n{output_dir}\n\n"
             f"・{base_name}_00.png (ベース)\n"
             f"・{base_name}_01.png ～ (差分)"
+            f"{trim_note}"
         )
+
+    def _load_settings(self):
+        """保存済み設定を読み込む"""
+        geometry = self.settings.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
+        splitter_sizes = self.settings.value("window/splitter_sizes")
+        if splitter_sizes:
+            try:
+                sizes = [int(v) for v in splitter_sizes]
+                if hasattr(self, "main_splitter"):
+                    self.main_splitter.setSizes(sizes)
+            except Exception:
+                pass
+
+        self._last_base_dir = self.settings.value("paths/base_dir", "", type=str)
+        self._last_add_dir = self.settings.value("paths/add_dir", "", type=str)
+        self._last_save_dir = self.settings.value("paths/save_dir", "", type=str)
+
+        self.check_auto_trim.setChecked(self.settings.value("align/auto_trim", True, type=bool))
+        self.spin_trim_margin.setValue(self.settings.value("align/trim_margin", 0, type=int))
+        self.spin_retry_threshold.setValue(self.settings.value("align/retry_threshold", 0.6, type=float))
+
+    def _save_settings(self):
+        """設定を保存"""
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        if hasattr(self, "main_splitter"):
+            self.settings.setValue("window/splitter_sizes", self.main_splitter.sizes())
+
+        self.settings.setValue("paths/base_dir", self._last_base_dir)
+        self.settings.setValue("paths/add_dir", self._last_add_dir)
+        self.settings.setValue("paths/save_dir", self._last_save_dir)
+
+        self.settings.setValue("align/auto_trim", self.check_auto_trim.isChecked())
+        self.settings.setValue("align/trim_margin", self.spin_trim_margin.value())
+        self.settings.setValue("align/retry_threshold", self.spin_retry_threshold.value())
+
+    def closeEvent(self, event):
+        self._save_settings()
+        super().closeEvent(event)
 
 
 def main():

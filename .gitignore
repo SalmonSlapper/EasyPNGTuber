@@ -8,6 +8,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.coverage
+.coverage.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.ipynb_checkpoints/
+*.log
 .Python
 build/
 develop-eggs/

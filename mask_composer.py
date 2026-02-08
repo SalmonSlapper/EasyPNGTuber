@@ -16,9 +16,9 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QMessageBox, QGroupBox,
     QSplitter, QScrollArea, QProgressDialog, QSpinBox, QSlider,
-    QRadioButton, QButtonGroup, QTabWidget, QComboBox
+    QRadioButton, QButtonGroup, QTabWidget, QComboBox, QCheckBox, QDoubleSpinBox
 )
-from PySide6.QtCore import Qt, Signal, QThread
+from PySide6.QtCore import Qt, Signal, QThread, QSettings
 from PySide6.QtGui import QPixmap, QShortcut, QKeySequence
 
 # パスを追加
@@ -28,7 +28,12 @@ from aligner import Aligner, AlignConfig
 from compositor import Compositor, CompositeConfig
 from mask_canvas import MaskCanvas
 from preview_widget import PreviewWidget
-from cv2_utils import load_image_as_bgra, save_image
+from cv2_utils import (
+    load_image_as_bgra,
+    save_image,
+    compute_common_valid_rect,
+    crop_image
+)
 
 
 @dataclass
@@ -37,6 +42,7 @@ class SliceItem:
     index: int
     image: np.ndarray
     aligned_image: Optional[np.ndarray] = None
+    valid_mask: Optional[np.ndarray] = None  # 255=有効領域
     alignment_success: bool = False
     alignment_score: float = 0.0
     is_base: bool = False
@@ -83,6 +89,7 @@ class SliceAlignWorker(QThread):
                 index=0,
                 image=slices[0],
                 aligned_image=slices[0].copy(),
+                valid_mask=np.full(slices[0].shape[:2], 255, dtype=np.uint8),
                 alignment_success=True,
                 alignment_score=1.0,
                 is_base=True
@@ -111,14 +118,18 @@ class SliceAlignWorker(QThread):
 
                 item = SliceItem(index=i, image=slices[i])
 
-                if result['success'] and result['matrix'] is not None:
-                    aligned = self.aligner.apply_transform(slices[i], result['matrix'], base_size)
+                if result['matrix'] is not None:
+                    aligned, valid_mask = self.aligner.apply_transform_with_mask(
+                        slices[i], result['matrix'], base_size
+                    )
                     item.aligned_image = aligned
-                    item.alignment_success = True
+                    item.valid_mask = valid_mask
+                    item.alignment_success = bool(result['success'])
                     item.alignment_score = result['score']
                 else:
-                    # 失敗時は元画像を保持
+                    # 行列推定失敗時は元画像を保持
                     item.aligned_image = slices[i].copy()
+                    item.valid_mask = np.full(slices[i].shape[:2], 255, dtype=np.uint8)
                     item.alignment_success = False
                     item.alignment_score = result.get('score', 0.0)
 
@@ -185,8 +196,14 @@ class MaskComposerWindow(QMainWindow):
         self.base_index: int = 0  # 選択中のベース画像インデックス
         self._onion_opacity: float = 0.0  # オニオンスキン透明度（0.0〜1.0）
 
+        # 設定保存
+        self.settings = QSettings("EasyPNGTuber", "MaskComposer")
+        self._last_input_dir = ""
+        self._last_output_dir = ""
+
         self._setup_ui()
         self._setup_shortcuts()
+        self._load_settings()
 
     def _setup_ui(self):
         central = QWidget()
@@ -194,6 +211,7 @@ class MaskComposerWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter = splitter
 
         # Left panel (resizable via splitter)
         left_panel = QWidget()
@@ -262,6 +280,27 @@ class MaskComposerWindow(QMainWindow):
         self.lbl_status.setStyleSheet('color: #888;')
         process_layout.addWidget(self.lbl_status)
 
+        retry_layout = QHBoxLayout()
+        retry_layout.addWidget(QLabel('要調整しきい値:'))
+        self.spin_issue_threshold = QDoubleSpinBox()
+        self.spin_issue_threshold.setRange(0.0, 1.0)
+        self.spin_issue_threshold.setSingleStep(0.05)
+        self.spin_issue_threshold.setDecimals(2)
+        self.spin_issue_threshold.setValue(0.6)
+        self.spin_issue_threshold.valueChanged.connect(self._update_alignment_summary)
+        retry_layout.addWidget(self.spin_issue_threshold)
+        process_layout.addLayout(retry_layout)
+
+        self.btn_next_issue_tab = QPushButton('次の要調整差分へ')
+        self.btn_next_issue_tab.clicked.connect(self._jump_to_next_issue_tab)
+        self.btn_next_issue_tab.setEnabled(False)
+        process_layout.addWidget(self.btn_next_issue_tab)
+
+        self.lbl_alignment_summary = QLabel('整列サマリ: 未実行')
+        self.lbl_alignment_summary.setWordWrap(True)
+        self.lbl_alignment_summary.setStyleSheet('color: #888;')
+        process_layout.addWidget(self.lbl_alignment_summary)
+
         # 処理済みフラグ
         self.is_processed = False
         left_layout.addWidget(process_group)
@@ -328,6 +367,21 @@ class MaskComposerWindow(QMainWindow):
         # Save
         save_group = QGroupBox('保存')
         save_layout = QVBoxLayout(save_group)
+
+        self.check_auto_trim = QCheckBox('位置合わせ余白を自動トリミング')
+        self.check_auto_trim.setChecked(True)
+        save_layout.addWidget(self.check_auto_trim)
+
+        trim_margin_layout = QHBoxLayout()
+        trim_margin_layout.addWidget(QLabel('マージン:'))
+        self.spin_trim_margin = QSpinBox()
+        self.spin_trim_margin.setRange(0, 100)
+        self.spin_trim_margin.setValue(0)
+        self.spin_trim_margin.setSuffix('px')
+        trim_margin_layout.addWidget(self.spin_trim_margin)
+        trim_margin_layout.addStretch()
+        save_layout.addLayout(trim_margin_layout)
+
         self.btn_save = QPushButton('全て一括保存...')
         self.btn_save.setStyleSheet('background-color: #16a34a; color: white;')
         self.btn_save.clicked.connect(self._save_all)
@@ -559,6 +613,7 @@ class MaskComposerWindow(QMainWindow):
             self.lbl_status.setText('分割サイズを変更しました。分割＆位置合わせを実行してください。')
             self.lbl_status.setStyleSheet('color: #fbbf24;')
             self.btn_save_current.setEnabled(False)
+        self._update_alignment_summary()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -571,8 +626,9 @@ class MaskComposerWindow(QMainWindow):
             self._load_image(path)
 
     def _select_file(self):
+        start_dir = self._last_input_dir or ''
         path, _ = QFileDialog.getOpenFileName(
-            self, '画像を選択', '',
+            self, '画像を選択', start_dir,
             '画像 (*.png *.jpg *.jpeg *.bmp *.webp)'
         )
         if path:
@@ -602,6 +658,7 @@ class MaskComposerWindow(QMainWindow):
         self.current_job_id += 1
         self.source_image = image
         self.source_path = path
+        self._last_input_dir = str(Path(path).parent)
         self.items = []
         self.composited_images = []
 
@@ -635,6 +692,7 @@ class MaskComposerWindow(QMainWindow):
         self.preview_base.set_base_image(None)
         for pw in self.preview_widgets:
             pw.set_base_image(None)
+        self._update_alignment_summary()
 
     def _execute_process(self):
         if self.source_image is None:
@@ -687,7 +745,7 @@ class MaskComposerWindow(QMainWindow):
         success_count = sum(1 for item in items if item.alignment_success)
         total_diffs = len(items) - 1
         self.lbl_status.setText(f'完了: {success_count - 1}/{total_diffs} 件成功')
-        self.lbl_status.setStyleSheet('color: #4ade80;')
+        self.lbl_status.setStyleSheet('color: #4ade80;' if (success_count - 1) == total_diffs else 'color: #fbbf24;')
         self.btn_process.setEnabled(True)
         self.combo_grid.setEnabled(True)  # Re-enable grid change after processing
 
@@ -699,6 +757,8 @@ class MaskComposerWindow(QMainWindow):
         )
 
         self._update_previews()
+        self._update_alignment_summary()
+        self.statusBar().showMessage('処理完了: 要調整しきい値で差分を確認してください')
 
     def _on_process_error(self, message: str):
         self.progress.close()
@@ -707,6 +767,7 @@ class MaskComposerWindow(QMainWindow):
         self.combo_grid.setEnabled(True)  # Re-enable grid change after error
         self.lbl_status.setText('エラー')
         self.lbl_status.setStyleSheet('color: #f87171;')
+        self._update_alignment_summary()
 
     def _on_cancel(self):
         if self.worker:
@@ -745,9 +806,10 @@ class MaskComposerWindow(QMainWindow):
         if self.source_image is None:
             return
         h, w = self.source_image.shape[:2]
-        # 2x2なので各スライスは元画像の約半分サイズ
-        slice_w = w // 2
-        slice_h = h // 2
+        # グリッドサイズに応じてスライスサイズを計算
+        grid_size = self.combo_grid.currentData()
+        slice_w = w // grid_size
+        slice_h = h // grid_size
         available_width = 600
         available_height = 500
         scale = min(available_width / slice_w, available_height / slice_h, 1.0)
@@ -889,6 +951,7 @@ class MaskComposerWindow(QMainWindow):
 
         # プレビュー更新
         self._update_previews()
+        self._update_alignment_summary()
 
     def _update_preview_tabs_for_base(self):
         """選択ベースに応じてプレビュータブを再構築"""
@@ -934,6 +997,94 @@ class MaskComposerWindow(QMainWindow):
         grid_size = self.combo_grid.currentData()
         total = grid_size * grid_size
         return [i for i in range(total) if i != self.base_index]
+
+    def _collect_issue_diff_indices(self) -> List[int]:
+        """低スコア/失敗の差分インデックスを収集"""
+        threshold = self.spin_issue_threshold.value() if hasattr(self, 'spin_issue_threshold') else 0.6
+        issue_indices: List[int] = []
+        for idx in self._get_diff_indices():
+            if idx >= len(self.items):
+                continue
+            item = self.items[idx]
+            if item.aligned_image is None:
+                issue_indices.append(idx)
+                continue
+            if (not item.alignment_success) or item.alignment_score < threshold:
+                issue_indices.append(idx)
+        return issue_indices
+
+    def _jump_to_next_issue_tab(self):
+        """次の要調整差分タブへ移動"""
+        issue_indices = self._collect_issue_diff_indices()
+        if not issue_indices:
+            QMessageBox.information(self, '情報', '要調整の差分はありません')
+            return
+
+        diff_indices = self._get_diff_indices()
+        issue_tab_indices = [diff_indices.index(idx) + 1 for idx in issue_indices if idx in diff_indices]
+        if not issue_tab_indices:
+            QMessageBox.information(self, '情報', '要調整差分タブが見つかりません')
+            return
+
+        current_tab = self.tab_preview.currentIndex()
+        next_tab = None
+        for tab_idx in issue_tab_indices:
+            if tab_idx > current_tab:
+                next_tab = tab_idx
+                break
+        if next_tab is None:
+            next_tab = issue_tab_indices[0]
+
+        self.tab_preview.setCurrentIndex(next_tab)
+        self.statusBar().showMessage('要調整差分タブへ移動しました')
+
+    def _update_alignment_summary(self, *_):
+        """整列サマリ表示を更新"""
+        if not hasattr(self, 'lbl_alignment_summary'):
+            return
+
+        if not self.items:
+            self.lbl_alignment_summary.setText('整列サマリ: 未実行')
+            self.lbl_alignment_summary.setStyleSheet('color: #888;')
+            if hasattr(self, 'btn_next_issue_tab'):
+                self.btn_next_issue_tab.setEnabled(False)
+            return
+
+        diff_indices = self._get_diff_indices()
+        if not diff_indices:
+            self.lbl_alignment_summary.setText('整列サマリ: 差分なし')
+            self.lbl_alignment_summary.setStyleSheet('color: #888;')
+            if hasattr(self, 'btn_next_issue_tab'):
+                self.btn_next_issue_tab.setEnabled(False)
+            return
+
+        diff_items = [self.items[idx] for idx in diff_indices if idx < len(self.items)]
+        if not diff_items:
+            self.lbl_alignment_summary.setText('整列サマリ: 差分なし')
+            self.lbl_alignment_summary.setStyleSheet('color: #888;')
+            if hasattr(self, 'btn_next_issue_tab'):
+                self.btn_next_issue_tab.setEnabled(False)
+            return
+
+        success_count = sum(1 for item in diff_items if item.alignment_success)
+        avg_score = sum(item.alignment_score for item in diff_items) / len(diff_items)
+        issue_count = len(self._collect_issue_diff_indices())
+        threshold = self.spin_issue_threshold.value() if hasattr(self, 'spin_issue_threshold') else 0.6
+
+        if issue_count == 0:
+            color = '#4ade80'
+            note = '良好'
+        else:
+            color = '#fbbf24'
+            note = '要調整あり'
+
+        self.lbl_alignment_summary.setText(
+            f'整列サマリ: 成功 {success_count}/{len(diff_items)} / 要調整 {issue_count}\n'
+            f'平均スコア {avg_score:.2f}（しきい値 {threshold:.2f}） {note}'
+        )
+        self.lbl_alignment_summary.setStyleSheet(f'color: {color};')
+        if hasattr(self, 'btn_next_issue_tab'):
+            self.btn_next_issue_tab.setEnabled(issue_count > 0)
 
     def _update_previews(self):
         if not self.items:
@@ -1022,6 +1173,28 @@ class MaskComposerWindow(QMainWindow):
 
         return blended
 
+    def _get_trim_rect(self, indices: List[int]) -> Optional[tuple]:
+        """指定インデックス群の共通有効領域からトリミング矩形を算出"""
+        if not self.check_auto_trim.isChecked():
+            return None
+
+        valid_masks = []
+        for idx in indices:
+            if idx < 0 or idx >= len(self.items):
+                continue
+            item = self.items[idx]
+            if item.aligned_image is None:
+                continue
+            if item.valid_mask is not None:
+                valid_masks.append(item.valid_mask)
+            else:
+                valid_masks.append(np.full(item.aligned_image.shape[:2], 255, dtype=np.uint8))
+
+        if not valid_masks:
+            return None
+
+        return compute_common_valid_rect(valid_masks, margin=self.spin_trim_margin.value())
+
     def _save_current(self):
         """現在選択中のタブの画像を個別保存"""
         current_index = self.tab_preview.currentIndex()
@@ -1037,6 +1210,7 @@ class MaskComposerWindow(QMainWindow):
             image = self.items[self.base_index].aligned_image
             base_label = self._get_position_label(self.base_index, grid_size)
             default_name = f'{base_name}_base_{base_label}.png'
+            trim_indices = [self.base_index]
         else:
             # 差分画像を保存
             comp_index = current_index - 1
@@ -1049,11 +1223,18 @@ class MaskComposerWindow(QMainWindow):
                 diff_idx = diff_indices[comp_index]
                 pos_label = self._get_position_label(diff_idx, grid_size)
                 default_name = f'{base_name}_差分{current_index}_{pos_label}.png'
+                trim_indices = [self.base_index, diff_idx]
             else:
                 default_name = f'{base_name}_差分{current_index}.png'
+                trim_indices = [self.base_index]
+
+        trim_rect = self._get_trim_rect(trim_indices)
+        if self.check_auto_trim.isChecked() and trim_rect is None:
+            QMessageBox.warning(self, '警告', 'トリミング範囲を計算できませんでした。画像サイズや位置合わせ結果を確認してください。')
+            return
 
         # ファイル保存ダイアログ
-        default_dir = str(Path(self.source_path).parent) if self.source_path else ''
+        default_dir = self._last_output_dir or (str(Path(self.source_path).parent) if self.source_path else '')
         path, _ = QFileDialog.getSaveFileName(
             self, '画像を保存',
             str(Path(default_dir) / default_name),
@@ -1064,7 +1245,11 @@ class MaskComposerWindow(QMainWindow):
             if not path.lower().endswith('.png'):
                 path += '.png'
             try:
-                save_image(path, image)
+                output_image = crop_image(image, trim_rect) if trim_rect is not None else image
+                ok = save_image(path, output_image)
+                if not ok:
+                    raise RuntimeError('save_image returned False')
+                self._last_output_dir = str(Path(path).parent)
                 QMessageBox.information(self, '完了', f'保存しました:\n{path}')
             except Exception as e:
                 QMessageBox.warning(self, 'エラー', f'保存に失敗しました:\n{e}')
@@ -1074,13 +1259,23 @@ class MaskComposerWindow(QMainWindow):
             QMessageBox.warning(self, '警告', '保存できる画像がありません')
             return
 
-        output_dir = QFileDialog.getExistingDirectory(self, '保存先フォルダを選択')
+        output_dir = QFileDialog.getExistingDirectory(
+            self, '保存先フォルダを選択', self._last_output_dir or self._last_input_dir or ''
+        )
         if not output_dir:
             return
+        self._last_output_dir = output_dir
 
         output_path = Path(output_dir)
         base_name = Path(self.source_path).stem if self.source_path else 'output'
         grid_size = self.combo_grid.currentData()
+        diff_indices = self._get_diff_indices()
+        trim_indices = [self.base_index, *diff_indices]
+        trim_rect = self._get_trim_rect(trim_indices)
+
+        if self.check_auto_trim.isChecked() and trim_rect is None:
+            QMessageBox.warning(self, '警告', 'トリミング範囲を計算できませんでした。画像サイズや位置合わせ結果を確認してください。')
+            return
 
         saved = 0
 
@@ -1088,11 +1283,13 @@ class MaskComposerWindow(QMainWindow):
         base_image = self.items[self.base_index].aligned_image
         base_label = self._get_position_label(self.base_index, grid_size)
         filename = f'{base_name}_01_base_{base_label}.png'
-        save_image(str(output_path / filename), base_image)
+        base_output = crop_image(base_image, trim_rect) if trim_rect is not None else base_image
+        if not save_image(str(output_path / filename), base_output):
+            QMessageBox.warning(self, 'エラー', f'{filename} の保存に失敗しました')
+            return
         saved += 1
 
         # 合成画像を保存
-        diff_indices = self._get_diff_indices()
         for i, image in enumerate(self.composited_images):
             if i < len(diff_indices):
                 diff_idx = diff_indices[i]
@@ -1100,12 +1297,20 @@ class MaskComposerWindow(QMainWindow):
                 filename = f'{base_name}_{i + 2:02d}_merged_{pos_label}.png'
             else:
                 filename = f'{base_name}_{i + 2:02d}_merged.png'
-            save_image(str(output_path / filename), image)
+            output_image = crop_image(image, trim_rect) if trim_rect is not None else image
+            if not save_image(str(output_path / filename), output_image):
+                QMessageBox.warning(self, 'エラー', f'{filename} の保存に失敗しました')
+                return
             saved += 1
+
+        trim_note = ''
+        if trim_rect is not None:
+            x, y, w, h = trim_rect
+            trim_note = f'\nトリミング: x={x}, y={y}, w={w}, h={h}'
 
         QMessageBox.information(
             self, '完了',
-            f'{saved} 枚の画像を保存しました:\n{output_dir}'
+            f'{saved} 枚の画像を保存しました:\n{output_dir}{trim_note}'
         )
 
     # === ショートカットキー設定 ===
@@ -1170,6 +1375,50 @@ class MaskComposerWindow(QMainWindow):
             display = self._blend_onion_skin(composited, diff_image)
 
         self.preview_widgets[widget_index].set_base_image(display)
+
+    def _load_settings(self):
+        """保存済み設定を読み込む"""
+        geometry = self.settings.value('window/geometry')
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
+        splitter_sizes = self.settings.value('window/splitter_sizes')
+        if splitter_sizes:
+            try:
+                self.main_splitter.setSizes([int(v) for v in splitter_sizes])
+            except Exception:
+                pass
+
+        self._last_input_dir = self.settings.value('paths/input_dir', '', type=str)
+        self._last_output_dir = self.settings.value('paths/output_dir', '', type=str)
+
+        self.spin_brush_size.setValue(self.settings.value('ui/brush_size', 30, type=int))
+        self.slider_feather.setValue(self.settings.value('ui/feather', 10, type=int))
+        self.check_auto_trim.setChecked(self.settings.value('save/auto_trim', True, type=bool))
+        self.spin_trim_margin.setValue(self.settings.value('save/trim_margin', 0, type=int))
+        self.spin_issue_threshold.setValue(self.settings.value('align/issue_threshold', 0.6, type=float))
+        self.slider_onion.setValue(self.settings.value('ui/onion_opacity', 0, type=int))
+
+        self._update_alignment_summary()
+
+    def _save_settings(self):
+        """設定を保存"""
+        self.settings.setValue('window/geometry', self.saveGeometry())
+        self.settings.setValue('window/splitter_sizes', self.main_splitter.sizes())
+
+        self.settings.setValue('paths/input_dir', self._last_input_dir)
+        self.settings.setValue('paths/output_dir', self._last_output_dir)
+
+        self.settings.setValue('ui/brush_size', self.spin_brush_size.value())
+        self.settings.setValue('ui/feather', self.slider_feather.value())
+        self.settings.setValue('save/auto_trim', self.check_auto_trim.isChecked())
+        self.settings.setValue('save/trim_margin', self.spin_trim_margin.value())
+        self.settings.setValue('align/issue_threshold', self.spin_issue_threshold.value())
+        self.settings.setValue('ui/onion_opacity', self.slider_onion.value())
+
+    def closeEvent(self, event):
+        self._save_settings()
+        super().closeEvent(event)
 
 
 def main():

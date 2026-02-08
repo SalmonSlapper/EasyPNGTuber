@@ -11,11 +11,24 @@ A tool for easily creating expression difference images for PNGTubers.
 
 ---
 
+## Updates (2026-02-08)
+
+- Added **auto-trimming for alignment borders**.  
+  When saving from `mask_composer.py`, `parts_mixer.py`, or `simple_aligner_app.py`, blank edges introduced by alignment can be removed automatically.
+- In each save section, enable **"Auto-trim alignment borders"** and adjust **margin (px)** if needed.
+- To minimize remaining border area, set margin to `0px`.
+
+---
+
 ## Features
 
 - Select eyes and mouth from different sources, auto-generate 4 patterns
 - Split & align from 2x2 expression sheets
 - High-precision alignment using AKAZE / ORB feature matching
+- Auto-trim blank borders created by alignment when saving
+- Visualized alignment status (scores and success ratios)
+- Re-tuning flow for low-score images (threshold and quick jump)
+- Auto-saved tool settings (last directories and key UI options)
 - Overlay display for comparing differences while drawing masks
 - Japanese file path support
 - Simple GUI (PySide6)
@@ -175,6 +188,11 @@ The `sample/` folder contains sample images for testing.
 - May fail if image differences are too large
 - Rotations beyond ±30 degrees are not supported
 
+### Blank borders appear after alignment
+
+- Enable **"Auto-trim alignment borders"** when saving
+- Use **margin (px)** to keep a small safety border if needed
+
 ---
 
 ## Technical Specifications
@@ -184,6 +202,13 @@ The `sample/` folder contains sample images for testing.
 - **AKAZE feature matching** (primary)
 - **ORB** (fallback)
 - **RANSAC** for affine transformation estimation
+- Binary descriptors are matched with binary-appropriate distance metrics
+
+### Auto-Trim Specification
+
+- A valid-region mask is generated together with each affine transform
+- Save-time cropping uses the intersection of valid regions across selected images
+- One shared crop rectangle is applied to all outputs to keep frame dimensions consistent
 
 ### Constraint Parameters
 

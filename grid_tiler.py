@@ -219,7 +219,9 @@ class GridTilerWindow(QMainWindow):
 
         try:
             tiled = self._create_tiled_image()
-            save_image(path, tiled)
+            ok = save_image(path, tiled)
+            if not ok:
+                raise RuntimeError('save_image returned False')
             QMessageBox.information(self, '完了', f'保存しました:\n{path}')
         except Exception as e:
             QMessageBox.warning(self, 'エラー', f'保存に失敗しました: {e}')

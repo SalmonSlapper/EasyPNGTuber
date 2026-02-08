@@ -16,9 +16,9 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QMessageBox, QGroupBox,
     QSplitter, QScrollArea, QProgressDialog, QSpinBox, QSlider,
-    QRadioButton, QButtonGroup, QComboBox, QGridLayout, QFrame
+    QRadioButton, QButtonGroup, QComboBox, QGridLayout, QFrame, QCheckBox
 )
-from PySide6.QtCore import Qt, Signal, QThread, QTimer
+from PySide6.QtCore import Qt, Signal, QThread, QTimer, QSettings
 from PySide6.QtGui import QPixmap, QShortcut, QKeySequence
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -26,7 +26,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 from compositor import Compositor, CompositeConfig
 from mask_canvas import MaskCanvas
 from preview_widget import PreviewWidget
-from cv2_utils import load_image_as_bgra, save_image, bgra_to_qimage
+from cv2_utils import (
+    load_image_as_bgra,
+    save_image,
+    bgra_to_qimage,
+    compute_common_valid_rect,
+    crop_image
+)
 from mask_composer import SliceAlignWorker, SliceItem
 
 
@@ -198,6 +204,11 @@ class PartsMixerWindow(QMainWindow):
         # 生成パターン
         self.generated_patterns: List[np.ndarray] = []
 
+        # 設定保存
+        self.settings = QSettings("EasyPNGTuber", "PartsMixer")
+        self._last_input_dir = ""
+        self._last_output_dir = ""
+
         # プレビュー更新デバウンス用タイマー
         self._preview_timer = QTimer()
         self._preview_timer.setSingleShot(True)
@@ -206,6 +217,8 @@ class PartsMixerWindow(QMainWindow):
 
         self._setup_ui()
         self._setup_shortcuts()
+        self._load_settings()
+        self._update_process_summary()
 
     def _setup_ui(self):
         central = QWidget()
@@ -213,6 +226,7 @@ class PartsMixerWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter = splitter
 
         # === 左パネル（コントロール） ===
         left_panel = QWidget()
@@ -257,6 +271,11 @@ class PartsMixerWindow(QMainWindow):
         self.btn_process.setEnabled(False)
         drop_layout.addWidget(self.btn_process)
 
+        self.lbl_process_summary = QLabel('未処理')
+        self.lbl_process_summary.setWordWrap(True)
+        self.lbl_process_summary.setStyleSheet('color: #888;')
+        drop_layout.addWidget(self.lbl_process_summary)
+
         left_layout.addWidget(drop_group)
 
         # 画像選択
@@ -286,6 +305,11 @@ class PartsMixerWindow(QMainWindow):
         self.combo_mouth.setEnabled(False)
         mouth_layout.addWidget(self.combo_mouth)
         select_layout.addLayout(mouth_layout)
+
+        self.btn_auto_select_sources = QPushButton('低スコア候補を自動選択')
+        self.btn_auto_select_sources.clicked.connect(self._auto_select_low_score_sources)
+        self.btn_auto_select_sources.setEnabled(False)
+        select_layout.addWidget(self.btn_auto_select_sources)
 
         left_layout.addWidget(select_group)
 
@@ -346,6 +370,21 @@ class PartsMixerWindow(QMainWindow):
         # 保存
         save_group = QGroupBox('保存')
         save_layout = QVBoxLayout(save_group)
+
+        self.check_auto_trim = QCheckBox('位置合わせ余白を自動トリミング')
+        self.check_auto_trim.setChecked(True)
+        save_layout.addWidget(self.check_auto_trim)
+
+        trim_margin_layout = QHBoxLayout()
+        trim_margin_layout.addWidget(QLabel('マージン:'))
+        self.spin_trim_margin = QSpinBox()
+        self.spin_trim_margin.setRange(0, 100)
+        self.spin_trim_margin.setValue(0)
+        self.spin_trim_margin.setSuffix('px')
+        trim_margin_layout.addWidget(self.spin_trim_margin)
+        trim_margin_layout.addStretch()
+        save_layout.addLayout(trim_margin_layout)
+
         self.btn_save = QPushButton('4パターン一括保存...')
         self.btn_save.setStyleSheet('background-color: #16a34a; color: white;')
         self.btn_save.clicked.connect(self._save_all)
@@ -508,8 +547,9 @@ class PartsMixerWindow(QMainWindow):
             self._load_image(path)
 
     def _select_file(self):
+        start_dir = self._last_input_dir or ''
         path, _ = QFileDialog.getOpenFileName(
-            self, '画像を選択', '',
+            self, '画像を選択', start_dir,
             '画像 (*.png *.jpg *.jpeg *.bmp *.webp)'
         )
         if path:
@@ -539,6 +579,7 @@ class PartsMixerWindow(QMainWindow):
         self.current_job_id += 1
         self.source_image = image
         self.source_path = path
+        self._last_input_dir = str(Path(path).parent)
         self.items = []
         self.generated_patterns = []
 
@@ -548,6 +589,8 @@ class PartsMixerWindow(QMainWindow):
         self.btn_process.setEnabled(True)
         self.btn_save.setEnabled(False)
         self._disable_combos()
+        self.btn_auto_select_sources.setEnabled(False)
+        self._update_process_summary()
 
     def _update_drop_zone_thumbnail(self, image: np.ndarray):
         """ドロップゾーンにサムネイル表示"""
@@ -578,6 +621,7 @@ class PartsMixerWindow(QMainWindow):
         self.generated_patterns = []
         self._update_combos()
         self._disable_combos()
+        self.btn_auto_select_sources.setEnabled(False)
 
         if self.source_image is not None:
             # グリッドサイズで割り切れるか検証
@@ -593,6 +637,7 @@ class PartsMixerWindow(QMainWindow):
             else:
                 self.btn_process.setEnabled(True)
             self.btn_save.setEnabled(False)
+        self._update_process_summary()
 
     # === 処理実行 ===
 
@@ -648,12 +693,15 @@ class PartsMixerWindow(QMainWindow):
 
         # プレビュー更新
         self._schedule_preview_update()
+        self._update_process_summary()
+        self.statusBar().showMessage('位置合わせ完了: スコアを確認し、必要なら低スコア候補を自動選択してください')
 
     def _on_process_error(self, message: str):
         self.progress.close()
         QMessageBox.warning(self, 'エラー', message)
         self.btn_process.setEnabled(True)
         self.combo_grid.setEnabled(True)
+        self._update_process_summary()
 
     def _on_cancel(self):
         if self.worker:
@@ -676,6 +724,89 @@ class PartsMixerWindow(QMainWindow):
             ]
         return positions[row][col]
 
+    def _format_source_label(self, index: int, grid_size: int) -> str:
+        """コンボ表示ラベル（スコア付き）"""
+        base_label = f'画像{index + 1}（{self._get_position_label(index, grid_size)}）'
+        if index >= len(self.items):
+            return base_label
+        item = self.items[index]
+        if item.aligned_image is None:
+            return base_label
+        mark = '✓' if item.alignment_success else '⚠'
+        return f'{base_label} {mark}{item.alignment_score:.2f}'
+
+    def _refresh_combo_labels(self):
+        """現在の選択状態を維持したままラベルだけ更新"""
+        grid_size = self.combo_grid.currentData()
+        for combo in [self.combo_base, self.combo_eye, self.combo_mouth]:
+            current_data = combo.currentData()
+            combo.blockSignals(True)
+            for i in range(combo.count()):
+                combo.setItemText(i, self._format_source_label(i, grid_size))
+            combo.blockSignals(False)
+            if current_data is not None:
+                restore_idx = combo.findData(current_data)
+                if restore_idx >= 0:
+                    combo.setCurrentIndex(restore_idx)
+
+    def _update_process_summary(self):
+        """処理結果サマリを更新"""
+        if not hasattr(self, 'lbl_process_summary'):
+            return
+
+        if not self.items:
+            self.lbl_process_summary.setText('未処理')
+            self.lbl_process_summary.setStyleSheet('color: #888;')
+            self.btn_auto_select_sources.setEnabled(False)
+            return
+
+        diff_items = [item for item in self.items if not item.is_base]
+        if not diff_items:
+            self.lbl_process_summary.setText('差分画像がありません')
+            self.lbl_process_summary.setStyleSheet('color: #fbbf24;')
+            self.btn_auto_select_sources.setEnabled(False)
+            return
+
+        success_count = sum(1 for item in diff_items if item.alignment_success)
+        avg_score = sum(item.alignment_score for item in diff_items) / len(diff_items)
+        fail_count = len(diff_items) - success_count
+
+        if fail_count == 0:
+            color = '#4ade80'
+            note = '全差分の整列に成功'
+        else:
+            color = '#fbbf24'
+            note = '低スコアがある場合は「低スコア候補を自動選択」→マスク調整推奨'
+
+        self.lbl_process_summary.setText(
+            f'整列: 成功 {success_count}/{len(diff_items)} / 平均スコア {avg_score:.2f}\n{note}'
+        )
+        self.lbl_process_summary.setStyleSheet(f'color: {color};')
+        self.btn_auto_select_sources.setEnabled(True)
+
+    def _auto_select_low_score_sources(self):
+        """低スコア差分を目/口ソース候補として自動選択"""
+        if len(self.items) < 2:
+            QMessageBox.information(self, '情報', '先に分割＆位置合わせを実行してください')
+            return
+
+        candidates = [
+            (idx, item.alignment_score)
+            for idx, item in enumerate(self.items)
+            if idx != self.base_index and item.aligned_image is not None
+        ]
+        if not candidates:
+            QMessageBox.information(self, '情報', '候補画像がありません')
+            return
+
+        candidates.sort(key=lambda x: x[1])
+        self.combo_eye.setCurrentIndex(self.combo_eye.findData(candidates[0][0]))
+        if len(candidates) >= 2:
+            self.combo_mouth.setCurrentIndex(self.combo_mouth.findData(candidates[1][0]))
+        else:
+            self.combo_mouth.setCurrentIndex(self.combo_mouth.findData(candidates[0][0]))
+        self.statusBar().showMessage('低スコア候補をソース選択に反映しました')
+
     def _update_combos(self):
         """コンボボックスを更新"""
         grid_size = self.combo_grid.currentData()
@@ -685,8 +816,7 @@ class PartsMixerWindow(QMainWindow):
             combo.blockSignals(True)
             combo.clear()
             for i in range(total):
-                label = self._get_position_label(i, grid_size)
-                combo.addItem(f'画像{i + 1}（{label}）', i)
+                combo.addItem(self._format_source_label(i, grid_size), i)
             combo.blockSignals(False)
 
         # デフォルト選択
@@ -921,17 +1051,50 @@ class PartsMixerWindow(QMainWindow):
 
     # === 保存 ===
 
+    def _get_trim_rect(self) -> Optional[tuple]:
+        """選択中ソースの共通有効領域からトリミング矩形を取得"""
+        if not self.check_auto_trim.isChecked():
+            return None
+        if not self.items:
+            return None
+
+        unique_indices = {self.base_index, self.eye_source_index, self.mouth_source_index}
+        valid_masks: List[np.ndarray] = []
+
+        for idx in unique_indices:
+            if idx < 0 or idx >= len(self.items):
+                continue
+            item = self.items[idx]
+            if item.aligned_image is None:
+                continue
+            if item.valid_mask is not None:
+                valid_masks.append(item.valid_mask)
+            else:
+                valid_masks.append(np.full(item.aligned_image.shape[:2], 255, dtype=np.uint8))
+
+        if not valid_masks:
+            return None
+
+        return compute_common_valid_rect(valid_masks, margin=self.spin_trim_margin.value())
+
     def _save_all(self):
         if not self.generated_patterns:
             QMessageBox.warning(self, '警告', '保存する画像がありません')
             return
 
-        output_dir = QFileDialog.getExistingDirectory(self, '保存先フォルダを選択')
+        output_dir = QFileDialog.getExistingDirectory(
+            self, '保存先フォルダを選択', self._last_output_dir or self._last_input_dir or ''
+        )
         if not output_dir:
             return
+        self._last_output_dir = output_dir
 
         output_path = Path(output_dir)
         base_name = Path(self.source_path).stem if self.source_path else 'output'
+        trim_rect = self._get_trim_rect()
+        if self.check_auto_trim.isChecked() and trim_rect is None:
+            QMessageBox.warning(self, '警告', 'トリミング範囲を計算できませんでした。')
+            return
 
         # 既存ファイルチェック
         names = [
@@ -955,15 +1118,65 @@ class PartsMixerWindow(QMainWindow):
         saved = 0
         for i, (name, image) in enumerate(zip(names, self.generated_patterns)):
             try:
-                save_image(str(output_path / name), image)
+                output_image = crop_image(image, trim_rect) if trim_rect is not None else image
+                ok = save_image(str(output_path / name), output_image)
+                if not ok:
+                    raise RuntimeError('save_image returned False')
                 saved += 1
             except Exception as e:
                 QMessageBox.warning(self, 'エラー', f'{name} の保存に失敗: {e}')
 
+        trim_note = ''
+        if trim_rect is not None:
+            x, y, w, h = trim_rect
+            trim_note = f'\nトリミング: x={x}, y={y}, w={w}, h={h}'
+
         QMessageBox.information(
             self, '完了',
-            f'{saved} 枚の画像を保存しました:\n{output_dir}'
+            f'{saved} 枚の画像を保存しました:\n{output_dir}{trim_note}'
         )
+
+    def _load_settings(self):
+        """保存済み設定を読み込み"""
+        geometry = self.settings.value('window/geometry')
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
+        splitter_sizes = self.settings.value('window/splitter_sizes')
+        if splitter_sizes:
+            try:
+                self.main_splitter.setSizes([int(v) for v in splitter_sizes])
+            except Exception:
+                pass
+
+        self._last_input_dir = self.settings.value('paths/input_dir', '', type=str)
+        self._last_output_dir = self.settings.value('paths/output_dir', '', type=str)
+
+        self.spin_brush_size.setValue(self.settings.value('ui/brush_size', 30, type=int))
+        self.slider_feather.setValue(self.settings.value('ui/feather', 10, type=int))
+        self.slider_eye_overlay.setValue(self.settings.value('ui/eye_overlay', 50, type=int))
+        self.slider_mouth_overlay.setValue(self.settings.value('ui/mouth_overlay', 50, type=int))
+        self.check_auto_trim.setChecked(self.settings.value('save/auto_trim', True, type=bool))
+        self.spin_trim_margin.setValue(self.settings.value('save/trim_margin', 0, type=int))
+
+    def _save_settings(self):
+        """現在設定を保存"""
+        self.settings.setValue('window/geometry', self.saveGeometry())
+        self.settings.setValue('window/splitter_sizes', self.main_splitter.sizes())
+
+        self.settings.setValue('paths/input_dir', self._last_input_dir)
+        self.settings.setValue('paths/output_dir', self._last_output_dir)
+
+        self.settings.setValue('ui/brush_size', self.spin_brush_size.value())
+        self.settings.setValue('ui/feather', self.slider_feather.value())
+        self.settings.setValue('ui/eye_overlay', self.slider_eye_overlay.value())
+        self.settings.setValue('ui/mouth_overlay', self.slider_mouth_overlay.value())
+        self.settings.setValue('save/auto_trim', self.check_auto_trim.isChecked())
+        self.settings.setValue('save/trim_margin', self.spin_trim_margin.value())
+
+    def closeEvent(self, event):
+        self._save_settings()
+        super().closeEvent(event)
 
 
 def main():

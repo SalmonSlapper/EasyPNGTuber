@@ -169,10 +169,7 @@ class PreviewWidget(QWidget):
         # 画像が収まるスケールを計算
         scale_w = available_w / img_w if img_w > 0 else 1.0
         scale_h = available_h / img_h if img_h > 0 else 1.0
-        self.scale = min(scale_w, scale_h, 1.0)  # 1.0より大きくしない
-        
-        self.scale_changed.emit(self.scale)
-        self.update_display()
+        self.set_scale(min(scale_w, scale_h, 1.0))  # set_scale() 経由でクランプ
     
     def update_display(self):
         """表示を更新"""
